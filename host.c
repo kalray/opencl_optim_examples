@@ -127,6 +127,11 @@ int main(int argc, char* argv[])
         float         device_elapsed_ms[2];
         bool          ocl_have_native_kernel;
     } kernel_desc[] = {
+        {
+            .name       = "sobel_step_0",
+            .globalSize = {ALIGN_MULT_UP(image_width, max_workgroup_size), image_height},
+            .localSize  = {max_workgroup_size, 1},
+        },
     };
 
     const int nb_kernels = sizeof(kernel_desc) / sizeof(kernel_desc[0]);
