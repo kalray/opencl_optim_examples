@@ -1,0 +1,4 @@
+*.o
+*.pocl
+output/
+.cache/
