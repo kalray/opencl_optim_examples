@@ -39,3 +39,11 @@
 
 #define HALO_SIZE  2
 #define DEFAULT_SOBEL_SCALE  (1.0f)
+
+#ifndef TILE_WIDTH
+#define TILE_WIDTH  256
+#endif  // TILE_WIDTH
+
+#ifndef TILE_HEIGHT
+#define TILE_HEIGHT 256
+#endif  // TILE_HEIGHT

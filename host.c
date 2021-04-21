@@ -132,6 +132,12 @@ int main(int argc, char* argv[])
             .globalSize = {ALIGN_MULT_UP(image_width, max_workgroup_size), image_height},
             .localSize  = {max_workgroup_size, 1},
         },
+        {
+            .name       = "sobel_step_1",
+            .globalSize = {(ceil(((double)image_width)  / TILE_WIDTH))  * max_workgroup_size,
+                           (ceil(((double)image_height) / TILE_HEIGHT)) * 1},
+            .localSize  = {max_workgroup_size, 1},
+        },
     };
 
     const int nb_kernels = sizeof(kernel_desc) / sizeof(kernel_desc[0]);
