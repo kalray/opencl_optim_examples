@@ -542,3 +542,191 @@ __kernel void sobel_step_3(__global uchar *image_in, __global uchar *image_out,
     // in the future steps
     wait_group_events(1, &event);
 }
+
+
+
+// ============================================================================
+// Step 4: Explicit Tiling + __local on both input/output + double-buffering
+//
+// - Same as Step-3, but with double-buffering and overlapping, this will be
+//   the ultimate optimization step on data transfer.
+// - Unlike previous steps 1/2/3, in which each WG computes one tile, and
+//   there are as many WG as the number of tiles in image. In this step, there
+//   will be only 5 WG spawned (CL_DEVICE_MAX_COMPUTE_UNITS). Each WG will be
+//   in charge of multiple tiles and perform overlapping through
+//   double-buffering and async-copy.
+// ============================================================================
+
+// We reuse the same sobel_compute_block_step_3() function for step-4
+static void sobel_compute_block_step_4(__local uchar *block_in_local,
+                                       __local uchar *block_out_local,
+                                       int block_in_row_stride, int block_out_row_stride,
+                                       int block_width, int block_height,
+                                       int block_width_halo, int block_height_halo,
+                                       float scale)
+__attribute__((alias("sobel_compute_block_step_3")));
+
+
+#define OCL_KERNEL_DMA_TILING_ENGINE_SOBEL(KERNEL_NAME, COMPUTE_BLOCK_FUNC)                       \
+                                                                                                  \
+__kernel void KERNEL_NAME(__global uchar *image_in, __global uchar *image_out,                    \
+                          int image_width, int image_height, float scale)                         \
+{                                                                                                 \
+    __local uchar block_in_local [2][(TILE_HEIGHT + HALO_SIZE) * (TILE_WIDTH + HALO_SIZE)];       \
+    __local uchar block_out_local[2][       TILE_HEIGHT        *        TILE_WIDTH       ];       \
+                                                                                                  \
+    event_t event_read[2]  = {0, 0};                                                              \
+    event_t event_write[2] = {0, 0};                                                              \
+                                                                                                  \
+    const int group_idx = get_group_id(0);                                                        \
+    const int group_idy = get_group_id(1);                                                        \
+                                                                                                  \
+    const int num_groups = get_num_groups(0) * get_num_groups(1);                                 \
+    const int group_id = (group_idy * get_num_groups(0)) + group_idx;                             \
+                                                                                                  \
+    const int num_blocks_x = (int)ceil(((float)image_width)  / TILE_WIDTH);                       \
+    const int num_blocks_y = (int)ceil(((float)image_height) / TILE_HEIGHT);                      \
+    const int num_blocks_total = num_blocks_x * num_blocks_y;                                     \
+                                                                                                  \
+    const int block_dispatch_step = num_groups;                                                   \
+    const int iblock_begin        = group_id;                                                     \
+    const int iblock_end          = num_blocks_total;                                             \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* PROLOGUE: prefetch first block                                        */                   \
+    /* ===================================================================== */                   \
+    int2 block_to_copy;                                                                           \
+    int4 local_point;                                                                             \
+    int4 global_point;                                                                            \
+                                                                                                  \
+    int iblock_x_next = iblock_begin % num_blocks_x;                                              \
+    int iblock_y_next = iblock_begin / num_blocks_x;                                              \
+                                                                                                  \
+    int block_idx_next = iblock_x_next * TILE_WIDTH;                                              \
+    int block_idy_next = iblock_y_next * TILE_HEIGHT;                                             \
+                                                                                                  \
+    int block_width_next  = min(TILE_WIDTH, (image_width-block_idx_next));                        \
+    int block_height_next = min(TILE_HEIGHT, (image_height-block_idy_next));                      \
+                                                                                                  \
+    int block_width_halo_next  = min((TILE_WIDTH+HALO_SIZE), (image_width-block_idx_next));       \
+    int block_height_halo_next = min((TILE_HEIGHT+HALO_SIZE), (image_height-block_idy_next));     \
+                                                                                                  \
+    /* prefetch first block */                                                                    \
+    int block_counter = 0;                                                                        \
+    block_to_copy = (int2)(block_width_halo_next, block_height_halo_next);                        \
+    local_point  = (int4)(0, 0, block_width_halo_next, block_height_halo_next);                   \
+    global_point = (int4)(block_idx_next, block_idy_next, image_width, image_height);             \
+                                                                                                  \
+    event_read[block_counter & 1] = async_work_group_copy_block_2D2D(                             \
+                    block_in_local[block_counter & 1],     /* __local buffer         */           \
+                    image_in,                              /* __global image         */           \
+                    1,                                     /* num_gentype_per_pixel  */           \
+                    block_to_copy,                         /* block to copy          */           \
+                    local_point,                           /* local_point            */           \
+                    global_point,                          /* global_point           */           \
+                    0);                                                                           \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* FOR-LOOP: Compute all blocks                                          */                   \
+    /* ===================================================================== */                   \
+    for (int iblock = iblock_begin; iblock < iblock_end; iblock += block_dispatch_step,           \
+                                                         block_counter++)                         \
+    {                                                                                             \
+        /* ------------------------------------------------------------ */                        \
+        /* current block to be processed                                */                        \
+        /* ------------------------------------------------------------ */                        \
+        const int iblock_parity        = block_counter & 1;                                       \
+                                                                                                  \
+        const int block_idx            = block_idx_next;                                          \
+        const int block_idy            = block_idy_next;                                          \
+                                                                                                  \
+        const int block_width          = block_width_next;                                        \
+        const int block_height         = block_height_next;                                       \
+                                                                                                  \
+        const int block_width_halo     = block_width_halo_next;                                   \
+        const int block_height_halo    = block_height_halo_next;                                  \
+                                                                                                  \
+        const int block_in_row_stride  = block_width_halo;                                        \
+        const int block_out_row_stride = block_width;                                             \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* prefetch next block (if any)                                 */                        \
+        /* ------------------------------------------------------------ */                        \
+        const int iblock_next = iblock + block_dispatch_step;                                     \
+                                                                                                  \
+        if (iblock_next < iblock_end)                                                             \
+        {                                                                                         \
+            const int iblock_next_parity = (block_counter+1) & 1;                                 \
+                                                                                                  \
+            iblock_x_next = iblock_next % num_blocks_x;                                           \
+            iblock_y_next = iblock_next / num_blocks_x;                                           \
+            block_idx_next = iblock_x_next * TILE_WIDTH;                                          \
+            block_idy_next = iblock_y_next * TILE_HEIGHT;                                         \
+                                                                                                  \
+            block_width_next  = min(TILE_WIDTH, (image_width-block_idx_next));                    \
+            block_height_next = min(TILE_HEIGHT, (image_height-block_idy_next));                  \
+                                                                                                  \
+            block_width_halo_next  = min((TILE_WIDTH+HALO_SIZE), (image_width-block_idx_next));   \
+            block_height_halo_next = min((TILE_HEIGHT+HALO_SIZE), (image_height-block_idy_next)); \
+                                                                                                  \
+            block_to_copy = (int2)(block_width_halo_next, block_height_halo_next);                \
+            local_point  = (int4)(0, 0, block_width_halo_next, block_height_halo_next);           \
+            global_point = (int4)(block_idx_next, block_idy_next, image_width, image_height);     \
+                                                                                                  \
+            event_read[iblock_next_parity] = async_work_group_copy_block_2D2D(                    \
+                        block_in_local[iblock_next_parity],    /* __local buffer         */       \
+                        image_in,                              /* __global image         */       \
+                        1,                                     /* num_gentype_per_pixel  */       \
+                        block_to_copy,                         /* block to copy          */       \
+                        local_point,                           /* local_point            */       \
+                        global_point,                          /* global_point           */       \
+                        0);                                                                       \
+        }                                                                                         \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* wait for prefetch of current block                           */                        \
+        /* ------------------------------------------------------------ */                        \
+        wait_group_events(1, &event_read[iblock_parity]);                                         \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* wait for previous put of the 2D block from local to global   */                        \
+        /* to avoid data race: writing result to a being-put buffer     */                        \
+        /* ------------------------------------------------------------ */                        \
+        if (block_counter >= 2) {                                                                 \
+            wait_group_events(1, &event_write[iblock_parity]);                                    \
+        }                                                                                         \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* now ready to compute the current block                       */                        \
+        /* ------------------------------------------------------------ */                        \
+        COMPUTE_BLOCK_FUNC(block_in_local[iblock_parity],                                         \
+                           block_out_local[iblock_parity],                                        \
+                           block_in_row_stride, block_out_row_stride,                             \
+                           block_width, block_height,                                             \
+                           block_width_halo, block_height_halo,                                   \
+                           scale);                                                                \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* put result to global memory                                  */                        \
+        /* ------------------------------------------------------------ */                        \
+        block_to_copy = (int2)(block_width, block_height);                                        \
+        local_point   = (int4)(    0    ,     0    , block_width, block_height);                  \
+        global_point  = (int4)(block_idx, block_idy, image_width, image_height);                  \
+        event_write[iblock_parity] = async_work_group_copy_block_2D2D(                            \
+                        image_out,                       /* __global image          */            \
+                        block_out_local[iblock_parity],  /* __local buffer          */            \
+                        1,                               /* num_gentype_per_pixel   */            \
+                        block_to_copy,                   /* block to copy           */            \
+                        local_point,                     /* local_point             */            \
+                        global_point,                    /* global_point            */            \
+                        0);                                                                       \
+                                                                                                  \
+    }                                                                                             \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* End of compute, fence all outstanding put                             */                   \
+    /* ===================================================================== */                   \
+    async_work_group_copy_fence(CLK_GLOBAL_MEM_FENCE);                                            \
+}
+
+OCL_KERNEL_DMA_TILING_ENGINE_SOBEL(sobel_step_4, sobel_compute_block_step_4)

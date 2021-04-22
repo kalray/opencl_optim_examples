@@ -91,6 +91,7 @@ int main(int argc, char* argv[])
     cl_program       program;          // program
     cl_mem           ocl_image_input;  // Device buffer for input image
     size_t           max_workgroup_size; // CL_DEVICE_MAX_WORK_GROUP_SIZE
+    cl_uint          max_compute_units;  // CL_DEVICE_MAX_COMPUTE_UNITS
 
     // ===================================================================
     // Device detection
@@ -100,6 +101,10 @@ int main(int argc, char* argv[])
 
     err = clGetDeviceIDs(platform, CL_DEVICE_TYPE_ACCELERATOR, 1, &device_id, NULL);
     OCL_CHECK_ERROR_QUIT(err, "Failed to clGetDeviceIDs");
+
+    err = clGetDeviceInfo(device_id, CL_DEVICE_MAX_COMPUTE_UNITS,
+                          sizeof(max_compute_units), &max_compute_units, NULL);
+    OCL_CHECK_ERROR_QUIT(err, "Failed to clGetDeviceInfo(CL_DEVICE_MAX_COMPUTE_UNITS)");
 
     err = clGetDeviceInfo(device_id, CL_DEVICE_MAX_WORK_GROUP_SIZE,
                           sizeof(max_workgroup_size), &max_workgroup_size, NULL);
@@ -148,6 +153,11 @@ int main(int argc, char* argv[])
             .name       = "sobel_step_3",
             .globalSize = {(ceil(((double)image_width)  / TILE_WIDTH))  * max_workgroup_size,
                            (ceil(((double)image_height) / TILE_HEIGHT)) * 1},
+            .localSize  = {max_workgroup_size, 1},
+        },
+        {
+            .name       = "sobel_step_4",
+            .globalSize = {max_workgroup_size * max_compute_units, 1},
             .localSize  = {max_workgroup_size, 1},
         },
     };
