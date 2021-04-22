@@ -730,3 +730,280 @@ __kernel void KERNEL_NAME(__global uchar *image_in, __global uchar *image_out,  
 }
 
 OCL_KERNEL_DMA_TILING_ENGINE_SOBEL(sobel_step_4, sobel_compute_block_step_4)
+
+
+
+// ============================================================================
+// Step 4-PAPI: PAPI Profiling
+//
+// - Now we have async-ed all the things, let's try identifying potential
+//   bottlenecks with some PAPI instrumentation.
+//
+// - Depending on image-processing algorithms, performance bottlenecks can be
+//   in data transfer, in pre/post-processing, or in compute_block() etc.
+//
+// ============================================================================
+
+#define MAX_PAPI_EVENTS 2
+
+#define PAPI_LOG_REAL_CYCLE(counter) \
+if (group_id < 5 && lidx == 0 && lidy == 0) { counter = PAPI_get_real_cyc(); }
+
+#define PAPI_ACCUMULATE_REAL_CYCLE(counter, acc) \
+if (group_id < 5 && lidx == 0 && lidy == 0) { acc += PAPI_get_real_cyc() - counter; }
+
+#define PAPI_LOG_REAL_USEC(counter) \
+if (group_id < 5 && lidx == 0 && lidy == 0) { counter = PAPI_get_real_usec(); }
+
+#define PAPI_ACCUMULATE_REAL_USEC(counter, acc) \
+if (group_id < 5 && lidx == 0 && lidy == 0) { acc += PAPI_get_real_usec() - counter; }
+
+
+#define OCL_KERNEL_DMA_TILING_ENGINE_SOBEL_PAPI(KERNEL_NAME, COMPUTE_BLOCK_FUNC)                  \
+                                                                                                  \
+__kernel void KERNEL_NAME(__global uchar *image_in, __global uchar *image_out,                    \
+                          int image_width, int image_height, float scale)                         \
+{                                                                                                 \
+    __local uchar block_in_local [2][(TILE_HEIGHT + HALO_SIZE) * (TILE_WIDTH + HALO_SIZE)];       \
+    __local uchar block_out_local[2][       TILE_HEIGHT        *        TILE_WIDTH       ];       \
+                                                                                                  \
+    event_t event_read[2]  = {0, 0};                                                              \
+    event_t event_write[2] = {0, 0};                                                              \
+                                                                                                  \
+    const int lidx = get_local_id(0);                                                             \
+    const int lidy = get_local_id(1);                                                             \
+                                                                                                  \
+    const int group_idx = get_group_id(0);                                                        \
+    const int group_idy = get_group_id(1);                                                        \
+                                                                                                  \
+    const int num_groups = get_num_groups(0) * get_num_groups(1);                                 \
+    const int group_id = (group_idy * get_num_groups(0)) + group_idx;                             \
+                                                                                                  \
+    const int num_blocks_x = (int)ceil(((float)image_width)  / TILE_WIDTH);                       \
+    const int num_blocks_y = (int)ceil(((float)image_height) / TILE_HEIGHT);                      \
+    const int num_blocks_total = num_blocks_x * num_blocks_y;                                     \
+                                                                                                  \
+    const int block_dispatch_step = num_groups;                                                   \
+    const int iblock_begin        = group_id;                                                     \
+    const int iblock_end          = num_blocks_total;                                             \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* PROLOGUE: prefetch first block                                        */                   \
+    /* ===================================================================== */                   \
+    int2 block_to_copy;                                                                           \
+    int4 local_point;                                                                             \
+    int4 global_point;                                                                            \
+                                                                                                  \
+    int iblock_x_next = iblock_begin % num_blocks_x;                                              \
+    int iblock_y_next = iblock_begin / num_blocks_x;                                              \
+                                                                                                  \
+    int block_idx_next = iblock_x_next * TILE_WIDTH;                                              \
+    int block_idy_next = iblock_y_next * TILE_HEIGHT;                                             \
+                                                                                                  \
+    int block_width_next  = min(TILE_WIDTH, (image_width-block_idx_next));                        \
+    int block_height_next = min(TILE_HEIGHT, (image_height-block_idy_next));                      \
+                                                                                                  \
+    int block_width_halo_next  = min((TILE_WIDTH+HALO_SIZE), (image_width-block_idx_next));       \
+    int block_height_halo_next = min((TILE_HEIGHT+HALO_SIZE), (image_height-block_idy_next));     \
+                                                                                                  \
+    /* prefetch first block */                                                                    \
+    int block_counter = 0;                                                                        \
+    block_to_copy = (int2)(block_width_halo_next, block_height_halo_next);                        \
+    local_point  = (int4)(0, 0, block_width_halo_next, block_height_halo_next);                   \
+    global_point = (int4)(block_idx_next, block_idy_next, image_width, image_height);             \
+                                                                                                  \
+    event_read[block_counter & 1] = async_work_group_copy_block_2D2D(                             \
+                    block_in_local[block_counter & 1],     /* __local buffer        */            \
+                    image_in,                              /* __global image        */            \
+                    1,                                     /* num_gentype_per_pixel */            \
+                    block_to_copy,                         /* block to copy         */            \
+                    local_point,                           /* local_point           */            \
+                    global_point,                          /* global_point          */            \
+                    0);                                                                           \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* Setting up PAPI                                                       */                   \
+    /* ===================================================================== */                   \
+    /* Hardware Performance Monitoring Counters (PMC)                        */                   \
+    /* With PAPI, each core can use upto two PMCs to track events.           */                   \
+    /* For simplicity, we use PE0 of each cluster to measure two differents  */                   \
+    /* events. User can refer to the Kalray PAPI manual and/or Kalray VLIW   */                   \
+    /* architecture document for details on these PMC events.                */                   \
+    __constant char *pmc_names[10]  = {                                                           \
+        /* Work-group 0 */ "PCC",   "EBE",                                                        \
+        /* Work-group 1 */ "DCLHE", "DCLME",                                                      \
+        /* Work-group 2 */ "DARSC", "LDSC",                                                       \
+        /* Work-group 3 */ "DMAE",  "DDSC",                                                       \
+        /* Work-group 4 */ "PSC",   "SC"                                                          \
+    };                                                                                            \
+    long pmc_values[MAX_PAPI_EVENTS] = {0};                                                       \
+    long tmp_cycle = 0;                                                                           \
+    long tmp_usec = 0;                                                                            \
+    long sobel_cycles = 0;                                                                        \
+    long sobel_usec = 0;                                                                          \
+    int  papi_evenSet = PAPI_NULL;                                                                \
+    if (group_id < 5 && lidx == 0 && lidy == 0) {                                                 \
+        int ret;                                                                                  \
+        ret = PAPI_create_eventset(&papi_evenSet);                                                \
+        if (ret != PAPI_OK) {                                                                     \
+           printf("Failed to PAPI_create_eventset\n");                                            \
+        }                                                                                         \
+        for (int i = 0; i < MAX_PAPI_EVENTS; i++) {                                               \
+            ret = PAPI_add_named_event(papi_evenSet, pmc_names[group_id*2 + i]);                  \
+            if (ret != PAPI_OK) {                                                                 \
+               printf("Failed to PAPI_add_named_event(%s)\n", pmc_names[group_id*2 + i]);         \
+            }                                                                                     \
+        }                                                                                         \
+    }                                                                                             \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* FOR-LOOP: Compute all blocks                                          */                   \
+    /* ===================================================================== */                   \
+    for (int iblock = iblock_begin; iblock < iblock_end; iblock += block_dispatch_step,           \
+                                                         block_counter++)                         \
+    {                                                                                             \
+        /* ------------------------------------------------------------ */                        \
+        /* current block to be processed                                */                        \
+        /* ------------------------------------------------------------ */                        \
+        const int iblock_parity        = block_counter & 1;                                       \
+                                                                                                  \
+        const int block_idx            = block_idx_next;                                          \
+        const int block_idy            = block_idy_next;                                          \
+                                                                                                  \
+        const int block_width          = block_width_next;                                        \
+        const int block_height         = block_height_next;                                       \
+                                                                                                  \
+        const int block_width_halo     = block_width_halo_next;                                   \
+        const int block_height_halo    = block_height_halo_next;                                  \
+                                                                                                  \
+        const int block_in_row_stride  = block_width_halo;                                        \
+        const int block_out_row_stride = block_width;                                             \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* prefetch next block (if any)                                 */                        \
+        /* ------------------------------------------------------------ */                        \
+        const int iblock_next = iblock + block_dispatch_step;                                     \
+                                                                                                  \
+        if (iblock_next < iblock_end)                                                             \
+        {                                                                                         \
+            const int iblock_next_parity = (block_counter+1) & 1;                                 \
+                                                                                                  \
+            iblock_x_next = iblock_next % num_blocks_x;                                           \
+            iblock_y_next = iblock_next / num_blocks_x;                                           \
+            block_idx_next = iblock_x_next * TILE_WIDTH;                                          \
+            block_idy_next = iblock_y_next * TILE_HEIGHT;                                         \
+                                                                                                  \
+            block_width_next  = min(TILE_WIDTH, (image_width-block_idx_next));                    \
+            block_height_next = min(TILE_HEIGHT, (image_height-block_idy_next));                  \
+                                                                                                  \
+            block_width_halo_next  = min((TILE_WIDTH+HALO_SIZE), (image_width-block_idx_next));   \
+            block_height_halo_next = min((TILE_HEIGHT+HALO_SIZE), (image_height-block_idy_next)); \
+                                                                                                  \
+            block_to_copy = (int2)(block_width_halo_next, block_height_halo_next);                \
+            local_point  = (int4)(0, 0, block_width_halo_next, block_height_halo_next);           \
+            global_point = (int4)(block_idx_next, block_idy_next, image_width, image_height);     \
+                                                                                                  \
+            event_read[iblock_next_parity] = async_work_group_copy_block_2D2D(                    \
+                        block_in_local[iblock_next_parity],    /* __local buffer        */        \
+                        image_in,                              /* __global image        */        \
+                        1,                                     /* num_gentype_per_pixel */        \
+                        block_to_copy,                         /* block to copy         */        \
+                        local_point,                           /* local_point           */        \
+                        global_point,                          /* global_point          */        \
+                        0);                                                                       \
+        }                                                                                         \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* wait for prefetch of current block                           */                        \
+        /* ------------------------------------------------------------ */                        \
+        wait_group_events(1, &event_read[iblock_parity]);                                         \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* wait for previous put of the 2D block from local to global   */                        \
+        /* to avoid data race: writing result to a being-put buffer     */                        \
+        /* ------------------------------------------------------------ */                        \
+        if (block_counter >= 2) {                                                                 \
+            wait_group_events(1, &event_write[iblock_parity]);                                    \
+        }                                                                                         \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* now ready to compute the current block                       */                        \
+        /* ------------------------------------------------------------ */                        \
+        PAPI_LOG_REAL_CYCLE(tmp_cycle);                                                           \
+        PAPI_LOG_REAL_USEC(tmp_usec);                                                             \
+                                                                                                  \
+        long pmc_unit[MAX_PAPI_EVENTS] = {0};                                                     \
+        if (group_id < 5 && lidx == 0 && lidy == 0) {                                             \
+            int ret;                                                                              \
+            ret = PAPI_reset(papi_evenSet);                                                       \
+            if (ret != PAPI_OK) {                                                                 \
+                printf("Failed to PAPI_reset\n");                                                 \
+            }                                                                                     \
+            ret = PAPI_start(papi_evenSet);                                                       \
+            if (ret != PAPI_OK) {                                                                 \
+                printf("Failed to PAPI_start\n");                                                 \
+            }                                                                                     \
+        }                                                                                         \
+                                                                                                  \
+        COMPUTE_BLOCK_FUNC(block_in_local[iblock_parity],                                         \
+                           block_out_local[iblock_parity],                                        \
+                           block_in_row_stride, block_out_row_stride,                             \
+                           block_width, block_height,                                             \
+                           block_width_halo, block_height_halo,                                   \
+                           scale);                                                                \
+                                                                                                  \
+        if (group_id < 5 && lidx == 0 && lidy == 0) {                                             \
+            int ret = PAPI_stop(papi_evenSet, pmc_unit);                                          \
+            if (ret != PAPI_OK) {                                                                 \
+                printf("Failed to PAPI_stop\n");                                                  \
+            }                                                                                     \
+                                                                                                  \
+            /* accumulate */                                                                      \
+            for (int i = 0; i < MAX_PAPI_EVENTS; i++) {                                           \
+                pmc_values[i] += pmc_unit[i];                                                     \
+            }                                                                                     \
+        }                                                                                         \
+                                                                                                  \
+        PAPI_ACCUMULATE_REAL_CYCLE(tmp_cycle, sobel_cycles);                                      \
+        PAPI_ACCUMULATE_REAL_USEC(tmp_usec, sobel_usec);                                          \
+                                                                                                  \
+        /* ------------------------------------------------------------ */                        \
+        /* put result to global memory                                  */                        \
+        /* ------------------------------------------------------------ */                        \
+        block_to_copy = (int2)(block_width, block_height);                                        \
+        local_point   = (int4)(    0    ,     0    , block_width, block_height);                  \
+        global_point  = (int4)(block_idx, block_idy, image_width, image_height);                  \
+        event_write[iblock_parity] = async_work_group_copy_block_2D2D(                            \
+                        image_out,                       /* __global image        */              \
+                        block_out_local[iblock_parity],  /* __local buffer        */              \
+                        1,                               /* num_gentype_per_pixel */              \
+                        block_to_copy,                   /* block to copy         */              \
+                        local_point,                     /* local_point           */              \
+                        global_point,                    /* global_point          */              \
+                        0);                                                                       \
+                                                                                                  \
+    }                                                                                             \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* Reporting PAPI                                                        */                   \
+    /* ===================================================================== */                   \
+    if (group_id < 5 && lidx == 0 && lidy == 0) {                                                 \
+        /* Note: These printf will slow-down this kernel. */                                      \
+        printf("[PAPI] sobel_step_4_PAPI(): WG %d: Processed %d blocks"                           \
+               "  sobel_cycles %ld  sobel_usec %ld = %.3f ms. %s %ld  %s %ld\n",                  \
+                group_id, block_counter,                                                          \
+                sobel_cycles, sobel_usec, (sobel_usec * 1E-3),                                    \
+                pmc_names[group_id*2 + 0], pmc_values[0],                                         \
+                pmc_names[group_id*2 + 1], pmc_values[1]);                                        \
+                                                                                                  \
+        PAPI_cleanup_eventset(papi_evenSet);                                                      \
+        PAPI_destroy_eventset(&papi_evenSet);                                                     \
+    }                                                                                             \
+                                                                                                  \
+    /* ===================================================================== */                   \
+    /* End of compute, fence all outstanding put                             */                   \
+    /* ===================================================================== */                   \
+    async_work_group_copy_fence(CLK_GLOBAL_MEM_FENCE);                                            \
+}
+
+OCL_KERNEL_DMA_TILING_ENGINE_SOBEL_PAPI(sobel_step_4_PAPI, sobel_compute_block_step_4)
