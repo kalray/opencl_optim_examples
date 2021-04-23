@@ -165,6 +165,11 @@ int main(int argc, char* argv[])
             .globalSize = {max_workgroup_size * max_compute_units, 1},
             .localSize  = {max_workgroup_size, 1},
         },
+        {
+            .name       = "sobel_step_5",
+            .globalSize = {max_workgroup_size * max_compute_units, 1},
+            .localSize  = {max_workgroup_size, 1},
+        },
     };
 
     const int nb_kernels = sizeof(kernel_desc) / sizeof(kernel_desc[0]);

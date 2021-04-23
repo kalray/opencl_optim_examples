@@ -1007,3 +1007,127 @@ __kernel void KERNEL_NAME(__global uchar *image_in, __global uchar *image_out,  
 }
 
 OCL_KERNEL_DMA_TILING_ENGINE_SOBEL_PAPI(sobel_step_4_PAPI, sobel_compute_block_step_4)
+
+
+
+// ============================================================================
+// Step 5: Compute_block optimization
+//
+// - Now the Step 4 has been instrumented. You should notice that, depending on
+//   the input image size, the compute_block() function may take from
+//   80% to 98% of kernel execution time.
+// - It's now time to perform some optimization on it:
+//   + Change compute type from float to short
+//   + Vectorization by manual loop-unrolling
+//   + You can also optimize the compute_block() function in a separate C or
+//     assembly kernel and plug it into this OpenCL via the MPPA Native
+//     extension (see Kalray OpenCL manual)
+// ============================================================================
+
+static void sobel_compute_block_step_5(__local uchar *block_in_local,
+                                       __local uchar *block_out_local,
+                                       int block_in_row_stride, int block_out_row_stride,
+                                       int block_width, int block_height,
+                                       int block_width_halo, int block_height_halo,
+                                       float scale)
+{
+    const int lsizex = get_local_size(0);
+    const int lsizey = get_local_size(1);
+
+    const int lidx = get_local_id(0);
+    const int lidy = get_local_id(1);
+
+    // number of workitems in workgroup
+    const int num_wi = lsizex * lsizey;
+
+    // linearized workitem id in workgroup
+    const int wid = lidx + lidy * lsizex;
+
+    // dispatch rows of block block_height x block_width on workitems
+    const int num_rows_per_wi   = block_height / num_wi;
+    const int num_rows_trailing = block_height % num_wi;
+
+    const int irow_begin = wid * num_rows_per_wi + min(wid, num_rows_trailing);
+    const int irow_end   = irow_begin + num_rows_per_wi + ((wid < num_rows_trailing) ? 1 : 0);
+
+    for (int irow = irow_begin; irow < irow_end; irow++)
+    {
+        int icol = 0;
+
+        // take care to not exceed 'block_width_halo' when doing
+        // vectorized neighbor reads
+        for (; icol + 8 + HALO_SIZE <= block_width_halo; icol += 8)
+        {
+            // load neighbors
+            short8 c0 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+0, icol+0)]));
+            short8 c1 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+0, icol+1)]));
+            short8 c2 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+0, icol+2)]));
+
+            short8 n0 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+1, icol+0)]));
+            short8 n2 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+1, icol+2)]));
+
+            short8 t0 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+2, icol+0)]));
+            short8 t1 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+2, icol+1)]));
+            short8 t2 = convert_short8(vload8(0, &block_in_local[BLOCK_IN_INDEX(irow+2, icol+2)]));
+
+            // compute
+            float8 magx = convert_float8(((short)2 * (n2 - n0)) + (c2 - c0 + t2 - t0));
+            float8 magy = convert_float8(((short)2 * (t1 - c1)) + (t0 - c0 + t2 - c2));
+            float8 mag  = hypot(magx, magy) * scale;
+
+            // store pixel
+            vstore8(convert_uchar8_sat(mag), 0, &block_out_local[BLOCK_OUT_INDEX(irow, icol)]);
+        }
+
+        for (; icol + 4 + HALO_SIZE <= block_width_halo; icol += 4)
+        {
+            // load neighbors
+            short4 c0 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+0, icol+0)]));
+            short4 c1 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+0, icol+1)]));
+            short4 c2 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+0, icol+2)]));
+
+            short4 n0 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+1, icol+0)]));
+            short4 n2 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+1, icol+2)]));
+
+            short4 t0 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+2, icol+0)]));
+            short4 t1 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+2, icol+1)]));
+            short4 t2 = convert_short4(vload4(0, &block_in_local[BLOCK_IN_INDEX(irow+2, icol+2)]));
+
+            // compute
+            float4 magx = convert_float4(((short)2 * (n2 - n0)) + (c2 - c0 + t2 - t0));
+            float4 magy = convert_float4(((short)2 * (t1 - c1)) + (t0 - c0 + t2 - c2));
+            float4 mag  = hypot(magx, magy) * scale;
+
+            // store pixel
+            vstore4(convert_uchar4_sat(mag), 0, &block_out_local[BLOCK_OUT_INDEX(irow, icol)]);
+        }
+
+        for (; icol < block_width; icol++)
+        {
+            // load neighbors
+            short c0 = block_in_local[BLOCK_IN_INDEX(irow+0, icol+0)];
+            short c1 = block_in_local[BLOCK_IN_INDEX(irow+0, icol+1)];
+            short c2 = block_in_local[BLOCK_IN_INDEX(irow+0, icol+2)];
+
+            short n0 = block_in_local[BLOCK_IN_INDEX(irow+1, icol+0)];
+            short n2 = block_in_local[BLOCK_IN_INDEX(irow+1, icol+2)];
+
+            short t0 = block_in_local[BLOCK_IN_INDEX(irow+2, icol+0)];
+            short t1 = block_in_local[BLOCK_IN_INDEX(irow+2, icol+1)];
+            short t2 = block_in_local[BLOCK_IN_INDEX(irow+2, icol+2)];
+
+            // compute
+            float magx = ((short)2 * (n2 - n0)) + (c2 - c0 + t2 - t0);
+            float magy = ((short)2 * (t1 - c1)) + (t0 - c0 + t2 - c2);
+            float mag  = hypot(magx, magy) * scale;
+
+            // store pixel
+            block_out_local[BLOCK_OUT_INDEX(irow, icol)] = convert_uchar_sat(mag);
+        }
+    }
+
+    // sync to gather result from all WI
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
+OCL_KERNEL_DMA_TILING_ENGINE_SOBEL(sobel_step_5, sobel_compute_block_step_5)
