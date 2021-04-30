@@ -27,9 +27,20 @@ endif
 all:
 
 
+# MPPA cluster kernel lib
+native_sobel_lib-name := native_sobel_lib
+native_sobel_lib-srcs := sobel_compute_block.c
+native_sobel_lib-system := cos
+# llvm gives better performance than gcc
+native_sobel_lib-compiler := llvm
+native_sobel_lib-cflags := $(fastmath_cflags)
+cluster-lib += native_sobel_lib
+
 # MPPA OpenCL pocl kernel
 sobel_kernel-name := sobel.cl.pocl
 sobel_kernel-srcs := sobel.cl
+sobel_kernel-cl-lflags := -lnative_sobel_lib
+sobel_kernel-deps := native_sobel_lib
 opencl-kernel-bin += sobel_kernel
 
 # Host acceleration binary

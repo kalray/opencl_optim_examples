@@ -175,6 +175,12 @@ int main(int argc, char* argv[])
             .globalSize = {max_workgroup_size * max_compute_units, 1},
             .localSize  = {max_workgroup_size, 1},
         },
+        {
+            .name       = "sobel_step_7_native",
+            .globalSize = {max_workgroup_size * max_compute_units, 1},
+            .localSize  = {max_workgroup_size, 1},
+            .ocl_have_native_kernel = true,
+        },
     };
 
     const int nb_kernels = sizeof(kernel_desc) / sizeof(kernel_desc[0]);
@@ -283,7 +289,7 @@ int main(int argc, char* argv[])
         // correctness check against the step-0 reference kernel
         bool passed = true;
         if (i > 0) {
-            // since we are using fast-inverse-square-root,
+            // Either enabling -ffast-math, or using fast-inverse-square-root,
             // there will be some pixel differences of +-1.
             // We set here the tolerance to 1
             const int tolerance = 1;

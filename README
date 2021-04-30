@@ -35,6 +35,7 @@ Code structure:
 ├── png_utils.c
 ├── png_utils.h
 ├── sobel.cl
+├── sobel_compute_block.c
 ├── sobel_config.h
 └── README
 

@@ -1278,3 +1278,60 @@ static void sobel_compute_block_step_6(__local uchar *block_in_local,
 }
 
 OCL_KERNEL_DMA_TILING_ENGINE_SOBEL(sobel_step_6_fast, sobel_compute_block_step_6)
+
+
+
+// ============================================================================
+// Step 7: Compute_block optimization (cont.)
+//
+// - We now use the Native function extension to optimize the compute_block()
+// function in a separate C/builtins file and plug it into this OpenCL kernel.
+// - We will particularly deal with square-root (sqrt) which are still
+// expensive in this OpenCL version, even with the Fast-inverse-square-root
+// algorithm.
+// - We will tune the square root function in the native C version through
+// some compilation flags (e.g. -ffast-math etc) to enable HW-based
+// inverse-square-root instruction.
+// - Reader is invited to refer to sobel_compute_block.c and Makefile for how
+// it is written, compiled and linked.
+// ============================================================================
+
+__attribute__((mppa_native))
+void native_sobel_compute_block(__local uchar *block_in_local,
+                                __local uchar *block_out_local,
+                                int block_in_row_stride, int block_out_row_stride,
+                                int block_width, int block_height,
+                                int block_width_halo, int block_height_halo,
+                                float scale,
+                                int num_wi, int wid);
+
+static void sobel_compute_block_step_7(__local uchar *block_in_local,
+                                       __local uchar *block_out_local,
+                                       int block_in_row_stride, int block_out_row_stride,
+                                       int block_width, int block_height,
+                                       int block_width_halo, int block_height_halo,
+                                       float scale)
+{
+    const int lsizex = get_local_size(0);
+    const int lsizey = get_local_size(1);
+
+    const int lidx = get_local_id(0);
+    const int lidy = get_local_id(1);
+
+    // number of workitems in workgroup
+    const int num_wi = lsizex * lsizey;
+
+    // linearized workitem id in workgroup
+    const int wid = lidx + lidy * lsizex;
+
+    native_sobel_compute_block(block_in_local, block_out_local,
+                               block_in_row_stride, block_out_row_stride,
+                               block_width, block_height,
+                               block_width_halo, block_height_halo,
+                               scale, num_wi, wid);
+
+    // sync to gather result from all WI
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
+OCL_KERNEL_DMA_TILING_ENGINE_SOBEL(sobel_step_7_native, sobel_compute_block_step_7)
