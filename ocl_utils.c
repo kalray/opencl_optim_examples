@@ -108,3 +108,24 @@ cl_program ocl_CreateProgramFromBinary(cl_context context,
 quit:
     return program;
 }
+
+
+/**
+ * @brief Compare two bytes array and return the position of the first diff
+ *
+ * @return The offset of the first difference, or the length of the arrays
+ *         if no difference is found.
+ **/
+size_t memdiff(const unsigned char *ref, const unsigned char *buf, const size_t size,
+               const int tolerance)
+{
+    int ret = size;
+    for (size_t k = 0; k < size; k++) {
+        if (abs((int)buf[k] - (int)ref[k]) > tolerance) {
+            printf("buf[%ld] %d differ from ref[%ld] %d\n", k, buf[k], k, ref[k]);
+            ret = k;
+            // break;
+        }
+    }
+    return ret;
+}

@@ -71,3 +71,6 @@ do {                                                                       \
 cl_program ocl_CreateProgramFromBinary(cl_context context,
                                        cl_device_id device,
                                        const char* binary_path);
+
+size_t memdiff(const unsigned char *ref, const unsigned char *buf, const size_t size,
+               const int tolerance);
