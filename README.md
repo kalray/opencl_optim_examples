@@ -84,6 +84,18 @@ From step 4 on, reader should also refer to `host.c` for the execution
 deployment parameters
 ([`clEnqueueNDRangeKernel()`](https://www.khronos.org/registry/OpenCL/sdk/1.2/docs/man/xhtml/clEnqueueNDRangeKernel.html)).
 
+__Requirements__:
+
+- Kalray AccessCore Embedded (ACE) SDK >= 4.5.0
+- `libpng` >= 1.6
+- `imagemagick` and provided `display` command
+
+Example install command on Ubuntu 18.04:
+
+```sh
+sudo apt install libpng16-16 imagemagick
+```
+
 __Run__:
 
 ```sh
