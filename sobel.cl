@@ -345,29 +345,56 @@ __kernel void sobel_step_2(__global uchar *image_in, __global uchar *image_out,
     //    - for-loop with 1D async-copy primitive (OpenCL 1.2)
     //    - Kalray extension 2D async-copy primitive
     //
-    // Let's use 2D copy for better performance than for-loop.
+    // Let's use 2D copy for better performance than for-loop, either
+    //    - OpenCL-3.0 draft spec of 2D2D, or
+    //    - Kalray-own extension of 2D2D (pixel-based)
 
-#define HAVE_ASYNC_COPY_2D2D
+#define HAVE_ASYNC_COPY_2D2D_OCL_3_0
+// #define HAVE_ASYNC_COPY_2D2D_KALRAY
 
-#ifndef HAVE_ASYNC_COPY_2D2D
+    // grayscale image, but can change on RGB or YUV or RGBA images
+    const size_t num_gentype_per_pixel = 1;
+
+#ifdef HAVE_ASYNC_COPY_2D2D_OCL_3_0
+    size_t num_elements_per_line  = block_width_halo * num_gentype_per_pixel;
+    size_t num_lines              = block_height_halo;
+    // pre-subtract strides by num_elements_per_line, then the call will
+    // (according to the spec) increment them by num_elements_per_line again
+    size_t src_stride             = (image_width * num_gentype_per_pixel) - num_elements_per_line;
+    size_t dst_stride             = (block_width_halo * num_gentype_per_pixel) - num_elements_per_line;
+    // copy to {0, 0} in __local
+    size_t local_offset_gentypes  = ((0 * block_width_halo) + 0) * num_gentype_per_pixel;
+    // copy from {block_idx, block_idy} in __global
+    size_t global_offset_gentypes = ((block_idy * image_width) + block_idx) * num_gentype_per_pixel;
+    event = async_work_group_copy_2D2D(
+                    block_in_local + local_offset_gentypes, // __local buffer (dst)
+                    image_in + global_offset_gentypes,      // __global buffer (src)
+                    num_elements_per_line,                  // num_elements_per_line
+                    num_lines,                              // num_lines
+                    src_stride,                             // src_stride
+                    dst_stride,                             // dst_stride
+                    0);
+#elif defined(HAVE_ASYNC_COPY_2D2D_KALRAY)
+    int2 block_to_copy = (int2)(block_width_halo, block_height_halo);
+    // copy to {0, 0} in __local
+    int4 local_point   = (int4)(0,         0,         block_width_halo, block_height_halo);
+    // copy from {block_idx, block_idy} in __global
+    int4 global_point  = (int4)(block_idx, block_idy, image_width,      image_height     );
+    event = async_work_group_copy_block_2D2D(
+                    block_in_local,         // __local buffer
+                    image_in,               // __global image
+                    num_gentype_per_pixel,  // num_gentype_per_pixel
+                    block_to_copy,          // block to copy
+                    local_point,            // local_point
+                    global_point,           // global_point
+                    0);
+#else
     for (int irow = 0; irow < block_height_halo; irow++)
     {
         event = async_work_group_copy(block_in_local + (irow * block_in_row_stride),
                                       block_in + (irow * block_out_row_stride),
                                       block_width_halo, 0);
     }
-#else
-    int2 block_to_copy = (int2)(block_width_halo, block_height_halo);
-    int4 local_point   = (int4)(    0    ,     0    , block_width_halo, block_height_halo);
-    int4 global_point  = (int4)(block_idx, block_idy, image_width     , image_height     );
-    event = async_work_group_copy_block_2D2D(
-                    block_in_local,   // __local buffer
-                    image_in,         // __global image
-                    1,                // num_gentype_per_pixel
-                    block_to_copy,    // block to copy
-                    local_point,      // local_point
-                    global_point,     // global_point
-                    0);
 #endif
 
     // Wait immediately. There is almost no overlapping. This will be tackled
